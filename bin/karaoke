@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""
+karaoke — UltraStar Deluxe song pipeline for Omarchy (Arch).
+Commands:
+  karaoke auth [--port 18080] [--force]   one-time Spotify user OAuth (stores refresh token)
+  karaoke top --limit N [--list FILE]     fetch your Spotify all-time top N tracks -> manifest + list
+  karaoke playlist <url|id> [--limit N]   fetch a Spotify playlist -> manifest + list
+  karaoke pull <list.txt | manifest.json | --top --limit N> [options]
+  karaoke scan [--path songs]
+  karaoke update [--check] [--do]
+  karaoke report
+Pure stdlib; shells out to yt-dlp / ffmpeg / ffprobe when needed. Secrets live in config/*.env (0600) —
+this tool never prints them. USDB protocol: login POST -> list?interpret&title -> gettxt wait -> form POST wd=1.
+"""
+import argparse, base64, hashlib, html, http.server, json, os, re, secrets, subprocess, sys, time, urllib.parse, urllib.request, http.cookiejar, threading, webbrowser
+
+HOME = os.path.expanduser("~")
+ROOT = os.path.join(HOME, "Projects", "karaoke")
+SONGS = os.path.join(ROOT, "songs")
+CONF = os.path.join(ROOT, "config")
+REPORTS = os.path.join(ROOT, "reports")
+TOKEN_FILE = os.path.join(CONF, "spotify_token.json")
+MANIFEST_FILE = os.path.join(CONF, "manifest.json")
+LIST_FILE = os.path.join(CONF, "top_list.txt")
+UA = "Mozilla/5.0 (X11; Linux x86_64) KaraokePull/0.1"
+SCOPE_BASE = "user-top-read"
+SCOPE_PLAYLISTS = " playlist-read-private playlist-read-collaborative"
+
+def log(*a):
+    print(*a, flush=True)
+
+def load_env(path):
+    d = {}
+    if os.path.exists(path):
+        for ln in open(path):
+            if "=" in ln and not ln.strip().startswith("#"):
+                k, v = ln.split("=", 1)
+                d[k.strip()] = v.strip()
+    return d
+
+def sanitize(name):
+    return re.sub(r'[\\/:*?"<>|]+', " ", name).strip()
+
+def norm(s):
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+# --------------------------------------------------------------------------- Spotify
+
+def sp_creds():
+    return load_env(os.path.join(CONF, "spotify.env"))
+
+def sp_token(method="basic"):
+    return (load_env(os.path.join(CONF, "spotify.env")).get("SPOTIFY_CLIENT_ID", ""),
+            load_env(os.path.join(CONF, "spotify.env")).get("SPOTIFY_CLIENT_SECRET", ""))
+
+def sp_post(payload, auth_basic=None):
+    req = urllib.request.Request("https://accounts.spotify.com/api/token",
+                                 data=urllib.parse.urlencode(payload).encode(),
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    if auth_basic:
+        cid, csec = sp_token()
+        req.add_header("Authorization", "Basic " + base64.b64encode(("%s:%s" % (cid, csec)).encode()).decode())
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+def sp_client_ok():
+    try:
+        sp_post({"grant_type": "client_credentials"}, auth_basic=True)
+        return True
+    except Exception:
+        return False
+
+def sp_store_token(j):
+    j.pop("token_type", None); j.pop("scope", None); j.pop("expires_in", None)
+    with open(TOKEN_FILE, "w") as fh:
+        json.dump({"refresh_token": j.get("refresh_token", ""),
+                   "client_id": sp_token()[0]}, fh, indent=1)
+    os.chmod(TOKEN_FILE, 0o600)
+
+def sp_load_refresh():
+    if os.path.exists(TOKEN_FILE):
+        try:
+            return json.load(open(TOKEN_FILE)).get("refresh_token", "")
+        except Exception:
+            return ""
+    return ""
+
+def sp_user_access():
+    rt = sp_load_refresh()
+    if not rt:
+        sys.exit("no Spotify refresh token — run: karaoke auth")
+    j = sp_post({"grant_type": "refresh_token", "refresh_token": rt}, auth_basic=True)
+    return j["access_token"]
+
+def sp_get(path, token=None):
+    token = token or sp_user_access()
+    req = urllib.request.Request("https://api.spotify.com/v1/" + path.lstrip("/"),
+                                 headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+def sp_parse_tracks(items):
+    out = []
+    for it in items:
+        tr = it.get("track") or it
+        art = ", ".join(a["name"] for a in tr.get("artists", []))
+        year = None
+        alb = tr.get("album", {})
+        rd = alb.get("release_date") or ""
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", rd): year = int(rd[:4])
+        elif re.match(r"^\d{4}$", rd): year = int(rd)
+        out.append({"artist": art, "title": tr.get("name", ""), "year": year,
+                    "spotify_id": tr.get("id", ""), "duration_ms": tr.get("duration_ms")})
+    return out
+
+def cmd_auth(args):
+    cid, _ = sp_token()
+    if not cid:
+        sys.exit("config/spotify.env missing SPOTIFY_CLIENT_ID")
+    if getattr(args, "redirect", None):
+        redirect = args.redirect
+        port = urllib.parse.urlparse(redirect).port or 18080
+    else:
+        port = args.port
+        redirect = "http://127.0.0.1:%d/callback" % port
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(9)
+    if args.scope is not None:
+        scope = args.scope
+    else:
+        scope = SCOPE_BASE + (SCOPE_PLAYLISTS if args.with_playlists else "")
+    scope = scope.strip()
+    params = {"client_id": cid, "response_type": "code", "redirect_uri": redirect,
+              "state": state, "code_challenge_method": "S256",
+              "code_challenge": challenge, "show_dialog": "true"}
+    if scope:
+        # percent-encode spaces (%20), never "+" — Spotify scope parsing is strict
+        url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode(params) + \
+              "&scope=" + urllib.parse.quote(scope, safe="")
+    else:
+        url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode(params)
+    got = {}
+    cb_path = urllib.parse.urlparse(redirect).path or "/"
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.urlparse(self.path)
+            if q.path == cb_path:
+                pr = urllib.parse.parse_qs(q.query)
+                got["code"] = pr.get("code", [None])[0]
+                got["state"] = pr.get("state", [None])[0]
+                if pr.get("error"):
+                    got["error"] = pr["error"][0]
+                    got["err_desc"] = (pr.get("error_description") or [""])[0]
+                    body = ("Spotify error: %s\n%s\n(close this tab and check the terminal)"
+                            % (got["error"], got["err_desc"])).encode()
+                elif got.get("code"):
+                    body = "OK - token saved, close this tab and return to the terminal.".encode()
+                else:
+                    body = "callback received without code or error - check terminal.".encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404); self.end_headers()
+        def log_message(self, *a): pass
+    srv = http.server.HTTPServer(("127.0.0.1", port), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log("Open this URL in a browser ON THIS MACHINE and approve (or any machine, then the callback must reach this port):")
+    log(url)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    log("Waiting for Spotify callback on %s ..." % redirect)
+    for _ in range(180):
+        if got.get("code") or got.get("error"):
+            break
+        time.sleep(1)
+    srv.shutdown()
+    if got.get("error"):
+        sys.exit("Spotify auth error: %s%s" % (got["error"], (" - " + got.get("err_desc", "")) if got.get("err_desc") else ""))
+    if got.get("state") != state or not got.get("code"):
+        sys.exit("auth failed (no/invalid callback; if Spotify said redirect_uri_mismatch, add %s to the app's Redirect URIs)" % redirect)
+    try:
+        j = sp_post({"grant_type": "authorization_code", "code": got["code"],
+                     "redirect_uri": redirect, "code_verifier": verifier}, auth_basic=True)
+    except urllib.error.HTTPError as e:
+        sys.exit("token exchange failed: HTTP %d %s" % (e.code, e.read().decode()[:300]))
+    sp_store_token(j)
+    log("auth OK — refresh token stored in config/spotify_token.json (0600)")
+
+def fetch_top(limit):
+    out = []
+    off = 0
+    while len(out) < limit:
+        n = min(50, limit - len(out))
+        j = sp_get("/me/top/tracks?time_range=long_term&limit=%d&offset=%d" % (n, off))
+        items = j.get("items", [])
+        if not items:
+            break
+        out.extend(sp_parse_tracks(items))
+        off += n
+        if len(items) < n:
+            break
+    return out[:limit]
+
+def fetch_playlist(pid, limit):
+    out = []
+    off = 0
+    while len(out) < (limit or 10 ** 9):
+        j = sp_get("/playlists/%s/tracks?limit=50&offset=%d&fields=items(track(id,name,artists(name),album(release_date,duration_ms)))" % (pid, off))
+        items = j.get("items", [])
+        if not items:
+            break
+        out.extend(sp_parse_tracks(items))
+        off += 50
+        if len(items) < 50:
+            break
+    return out[:limit] if limit else out
+
+def cmd_top(args):
+    items = fetch_top(args.limit)
+    if not items:
+        sys.exit("no top tracks returned")
+    save_manifest(items)
+    with open(LIST_FILE, "w") as fh:
+        for i, it in enumerate(items, 1):
+            fh.write("%d\t%s - %s\t%d\n" % (i, it["artist"], it["title"], it["year"] or 0))
+    log("top %d all-time saved -> %s and %s" % (len(items), MANIFEST_FILE, LIST_FILE))
+    for i, it in enumerate(items, 1):
+        log("  %2d. %s - %s (%s)" % (i, it["artist"], it["title"], it["year"] or "?"))
+    if args.list:
+        with open(args.list, "w") as fh:
+            for i, it in enumerate(items, 1):
+                fh.write("%s - %s\n" % (it["artist"], it["title"]))
+        log("list written ->", args.list)
+
+def save_manifest(items):
+    with open(MANIFEST_FILE, "w") as fh:
+        json.dump({"source": "spotify", "updated": time.strftime("%Y-%m-%dT%H:%M:%S"), "entries": items}, fh, indent=1)
+    os.chmod(MANIFEST_FILE, 0o600)
+
+def load_manifest():
+    if not os.path.exists(MANIFEST_FILE):
+        return []
+    return json.load(open(MANIFEST_FILE)).get("entries", [])
+
+def playlist_id_from(url_or_id):
+    m = re.search(r"playlist[/:]([A-Za-z0-9]+)", url_or_id)
+    return m.group(1) if m else url_or_id
+
+# --------------------------------------------------------------------------- USDB client
+
+class Usdb:
+    def __init__(self, env):
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.opener.addheaders = [("User-Agent", UA), ("Referer", "https://usdb.animux.de/")]
+        self.user = env.get("USDB_USER", ""); self.passw = env.get("USDB_PASS", "")
+        self._logged = False
+
+    def login(self):
+        if self._logged:
+            return
+        data = urllib.parse.urlencode({"user": self.user, "pass": self.passw, "login": "Login"}).encode()
+        try:
+            r = self.opener.open("https://usdb.animux.de/index.php", data=data, timeout=40)
+            r.read()
+        except urllib.error.HTTPError as e:
+            sys.exit("USDB login HTTP %d" % e.code)
+        self._logged = True
+
+    def _get(self, url):
+        return self.opener.open(url, timeout=40).read().decode("utf-8", "ignore")
+
+    def search(self, artist, title, pages=3):
+        """Return list of dicts {id, artist, title, genre, year} parsed from list rows."""
+        rows = []
+        for start in range(0, pages * 30, 30):
+            q = urllib.parse.urlencode({"link": "list", "interpret": artist, "title": title, "start": start})
+            h = self._get("https://usdb.animux.de/index.php?" + q)
+            page_rows = []
+            for m in re.finditer(r'<tr[^>]*data-songid="(\d+)"[^>]*>(.*?)</tr>', h, re.S):
+                sid = m.group(1)
+                cells = [re.sub(r"<[^>]+>", " ", c).strip() for c in re.findall(r"<td[^>]*>(.*?)</td>", m.group(2), re.S)]
+                cells = [re.sub(r"\s+", " ", c) for c in cells]
+                # header or empty rows have no year-like cells -> guard
+                page_rows.append({"id": sid, "artist": artist, "title": title,
+                                  "artist_cell": cells[0] if len(cells) > 0 else "",
+                                  "title_cell": cells[1] if len(cells) > 1 else "",
+                                  "genre": cells[2] if len(cells) > 2 else "",
+                                  "year": cells[3] if len(cells) > 3 else ""})
+            rows.extend(page_rows)
+            if len(page_rows) < 30:
+                break
+        return rows
+
+    def match(self, rows, artist, title, want_year=None):
+        """score rows; pick best or None"""
+        def score(r):
+            s = 0
+            a = norm(r.get("artist_cell")); t = norm(r.get("title_cell"))
+            if a == norm(artist): s += 5
+            elif a and (a in norm(artist) or norm(artist) in a): s += 2
+            if t == norm(title): s += 5
+            elif t and (t in norm(title) or norm(title) in t): s += 2
+            y = None
+            if r.get("year") and re.match(r"^\d{4}$", r["year"].strip()):
+                y = int(r["year"].strip())
+            if want_year and y and abs(y - want_year) <= 1: s += 1
+            return s
+        best = None; bs = -1
+        for r in rows:
+            s = score(r)
+            if s > bs:
+                bs, best = s, r
+        return best if bs >= 7 else None
+
+    def fetch_txt(self, sid, max_wait=75):
+        """GET gettxt -> parse wait seconds -> POST wd=1 -> return raw txt (unescaped)."""
+        page = self._get("https://usdb.animux.de/index.php?link=gettxt&id=" + sid)
+        m = re.search(r"time\s*=\s*(\d+)", page)
+        wait = int(m.group(1)) if m else 24
+        if wait > max_wait:
+            wait = max_wait
+        if wait > 0:
+            log("      (usdb txt wait %ss)" % wait)
+            time.sleep(wait)
+        req = urllib.request.Request("https://usdb.animux.de/index.php?link=gettxt&id=" + sid,
+                                     data=urllib.parse.urlencode({"wd": "1"}).encode())
+        req.add_header("Referer", "https://usdb.animux.de/index.php?link=gettxt&id=" + sid)
+        body = self.opener.open(req, timeout=60).read().decode("utf-8", "ignore")
+        m = re.search(r"<textarea[^>]*name=[\"']txt[\"'][^>]*>(.*?)</textarea>", body, re.S)
+        if not m:
+            return None
+        return html.unescape(m.group(1))
+
+    def fetch_cover(self, sid, dest):
+        try:
+            req = urllib.request.Request("https://usdb.animux.de/data/cover/%s.jpg" % sid,
+                                         headers={"User-Agent": UA})
+            with self.opener.open(req, timeout=30) as r:
+                data = r.read()
+            if data[:3] == b"\xff\xd8\xff" and len(data) > 2000:
+                with open(dest, "wb") as fh:
+                    fh.write(data)
+                return True
+        except Exception:
+            pass
+        return False
+
+# --------------------------------------------------------------------------- audio / files
+
+def yt_dlp_audio(video_id, out_base, artist, title):
+    """Download youtube video audio as mp3 -> out_base.mp3. Returns path or None."""
+    url = "https://www.youtube.com/watch?v=%s" % video_id
+    cmd = ["yt-dlp", "-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0",
+           "--no-playlist", "--no-progress", "-o", out_base + ".%(ext)s", "--", url]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if p.returncode == 0 and os.path.exists(out_base + ".mp3"):
+            return out_base + ".mp3"
+        log("      yt-dlp failed (%d): %s" % (p.returncode, (p.stderr or "")[-200:].strip()))
+    except Exception as e:
+        log("      yt-dlp error: %r" % e)
+    return None
+
+def rewrite_header(raw_txt, mp3_name, cover_name=None, artist=None, title=None):
+    """normalize header tags; keep notes intact; force #MP3 and optional #COVER."""
+    raw_txt = raw_txt.lstrip("\ufeff")
+    lines = raw_txt.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    notes_start = len(lines)
+    tags = []
+    for i, ln in enumerate(lines):
+        if ln.startswith("#"):
+            m = re.match(r"^#([A-Za-z0-9_]+):\s?(.*)$", ln)
+            if m:
+                tags.append([m.group(1).upper(), m.group(2).strip()])
+                continue
+        if ln.strip() == "":
+            continue  # blank lines inside the header are ignored
+        notes_start = i
+        break
+    notes = lines[notes_start:]
+    names = {t[0] for t in tags}
+    if "MP3" not in names and mp3_name:
+        tags.insert(1, ["MP3", mp3_name])
+    else:
+        for t in tags:
+            if t[0] == "MP3" and mp3_name:
+                t[1] = mp3_name
+    if cover_name:
+        if "COVER" not in names:
+            tags.append(["COVER", cover_name])
+        else:
+            for t in tags:
+                if t[0] == "COVER":
+                    t[1] = cover_name
+    if artist and "ARTIST" not in names:
+        tags.insert(0, ["ARTIST", artist])
+    if title and "TITLE" not in names:
+        tags.insert(0, ["TITLE", title])
+    out = "\n".join("#%s:%s" % (k, v) for k, v in tags)
+    if notes and notes[0].strip() == "" and notes_start > 0:
+        out += "\n" + "\n".join(notes)
+    else:
+        out += "\n" + "\n".join(notes)
+    return out.strip() + "\n"
+
+def ffprobe_seconds(path):
+    p = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1", path],
+                       capture_output=True, text=True, timeout=60)
+    try:
+        return float(p.stdout.strip())
+    except Exception:
+        return None
+
+# --------------------------------------------------------------------------- engine
+
+def entry_line(line):
+    """parse 'Artist - Title' (optionally with leading rank\t / trailing year\t)"""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = re.split(r"\t+", line)
+    if len(parts) >= 2 and parts[1] != "":
+        line = parts[1]
+    m = re.match(r"^(.*?)\s+-\s+(.+?)(?:\s+\d{4})?$", line)
+    if not m:
+        return None
+    return {"artist": m.group(1).strip(), "title": m.group(2).strip()}
+
+def entries_from_file(path):
+    out = []
+    for ln in open(path):
+        e = entry_line(ln)
+        if e:
+            out.append(e)
+    return out
+
+def entries_from_list_file(path):
+    out = []
+    for ln in open(path):
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        parts = [p for p in re.split(r"\t+", ln) if p != ""]
+        rank = year = None
+        body = None
+        if len(parts) >= 3 and parts[1] != "":       # RANK \t Song \t YEAR
+            rank, body, y = parts[0], parts[1], parts[2]
+        elif len(parts) == 2 and re.match(r"^\d{4}$", parts[1].strip()):  # Song \t YEAR
+            body, y = parts[0], parts[1]
+        else:
+            body = ln
+            y = None
+        if re.match(r"^\d{4}$", (y or "").strip()):
+            year = int(y.strip())
+        e = entry_line(body)
+        if e:
+            e["year"] = year
+            e["rank"] = int(rank) if rank and rank.isdigit() else None
+            out.append(e)
+    return out
+
+def pull_one(usdb, artist, title, year=None, no_audio=False, no_cover=False, force=False):
+    ar = sanitize(artist) or "Unknown"
+    ti = sanitize(title) or "Unknown"
+    folder = os.path.join(SONGS, ar, "%s - %s" % (ar, ti))
+    txt_name = "%s - %s.txt" % (ar, ti)
+    if os.path.exists(os.path.join(folder, txt_name)) and not force:
+        return "skip(exists)"
+    log("== %s - %s%s" % (artist, title, (" (%d)" % year) if year else ""))
+    hit = None
+    try:
+        usdb.login()
+        first_artist = re.split(r"[,&]|\s+feat\.?", artist, flags=re.I)[0].strip()
+        attempts = []
+        attempts.append(("artist+title", lambda: usdb.search(artist, title)))
+        if first_artist and norm(first_artist) != norm(artist):
+            attempts.append(("first-artist", lambda: usdb.search(first_artist, "", pages=5)))
+        attempts.append(("artist-only", lambda: usdb.search(artist, "", pages=5)))
+        attempts.append(("title-only", lambda: usdb.search("", title)))
+        for label, fn in attempts:
+            try:
+                rows = fn()
+            except Exception:
+                continue
+            if not rows:
+                continue
+            hit = usdb.match(rows, artist, title, year)
+            if hit and hit.get("id"):
+                log("   match via %s" % label)
+                break
+    except Exception as e:
+        log("   search error: %r" % e)
+        return "search-error"
+    if not (hit and hit.get("id")):
+        log("   no USDB result")
+        return "not-found"
+    log("   usdb id %s | %s - %s (%s) | %s" % (hit["id"], hit["artist_cell"], hit["title_cell"], hit["year"], hit["genre"]))
+    raw = usdb.fetch_txt(hit["id"])
+    if not raw:
+        log("   txt fetch failed")
+        return "txt-error"
+    os.makedirs(folder, exist_ok=True)
+    vid = None
+    m = re.search(r"#VIDEO:\s*v=([\w-]{6,20})", raw)
+    if m:
+        vid = m.group(1)
+    mp3_name = txt_name.replace(".txt", ".mp3")
+    text = rewrite_header(raw, mp3_name, artist=hit.get("artist_cell") or artist, title=hit.get("title_cell") or title)
+    with open(os.path.join(folder, txt_name), "w") as fh:
+        fh.write(text)
+    cover_ok = False
+    if not no_cover:
+        cover_ok = usdb.fetch_cover(hit["id"], os.path.join(folder, "cover.jpg"))
+    if cover_ok:
+        with open(os.path.join(folder, txt_name), "r") as fh:
+            t2 = rewrite_header(fh.read(), mp3_name, cover_name="cover.jpg",
+                                artist=hit.get("artist_cell") or artist, title=hit.get("title_cell") or title)
+        with open(os.path.join(folder, txt_name), "w") as fh:
+            fh.write(t2)
+    if not no_audio:
+        if vid:
+            path = yt_dlp_audio(vid, os.path.join(folder, txt_name[:-4]), artist, title)
+        if not vid or not path:
+            log("   no #VIDEO or yt-dlp failed -> ytsearch fallback")
+            cmd = ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0",
+                   "--no-playlist", "--no-progress", "--default-search", "ytsearch1",
+                   "-o", os.path.join(folder, txt_name[:-4]) + ".%(ext)s",
+                   "--", "%s - %s" % (artist, title)]
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            path = os.path.join(folder, mp3_name) if os.path.exists(os.path.join(folder, mp3_name)) else None
+        if path:
+            dur = ffprobe_seconds(path)
+            log("   audio OK %s (%ss)" % (os.path.basename(path), int(dur) if dur else "?"))
+    return "ok"
+
+def cmd_pull(args):
+    usdb_env = load_env(os.path.join(CONF, "creds.env"))
+    usdb = Usdb(usdb_env)
+    entries = []
+    src = args.source
+    if args.top or src == "--top":
+        if not load_manifest():
+            sys.exit("no manifest yet — run: karaoke top --limit N")
+        entries = load_manifest()
+    elif src and os.path.exists(src):
+        if src.endswith(".json"):
+            entries = [{"artist": e.get("artist"), "title": e.get("title"), "year": e.get("year")}
+                       for e in json.load(open(src)).get("entries", [])]
+        else:
+            entries = entries_from_list_file(src)
+    else:
+        sys.exit("pull needs a list file or --top")
+    if args.limit:
+        entries = entries[:args.limit]
+    log("pulling %d songs into %s" % (len(entries), SONGS))
+    stats = {"ok": 0, "skip": 0, "not-found": 0, "txt-error": 0, "search-error": 0}
+    t0 = time.time()
+    for e in entries:
+        artist = e.get("artist"); title = e.get("title"); year = e.get("year")
+        if not artist or not title:
+            continue
+        st = pull_one(usdb, artist, title, year, no_audio=args.no_audio, no_cover=args.no_cover, force=args.force)
+        stats[st if st in stats else "ok" if st == "ok" else "not-found"] = stats.get(st if st in stats else "not-found", 0) + 1
+        log("   -> %s" % st)
+    log("done in %.0fs: %s" % (time.time() - t0, stats))
+    with open(os.path.join(REPORTS, "pull-%s.log" % time.strftime("%Y%m%d-%H%M%S")), "w") as fh:
+        fh.write("karaoke pull %s\nstats: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), stats))
+    return stats
+
+# --------------------------------------------------------------------------- scan / update
+
+def cmd_scan(args):
+    root = args.path or SONGS
+    ok = bad = 0
+    issues = []
+    for dp, dns, fns in os.walk(root):
+        txts = [f for f in fns if f.lower().endswith(".txt")]
+        for tf in txts:
+            path = os.path.join(dp, tf)
+            raw = open(path, encoding="utf-8", errors="ignore").read()
+            has = {}
+            for tag in ("TITLE", "ARTIST", "MP3"):
+                m = re.search(r"^#%s:\s*(.+)$" % tag, raw, re.M)
+                has[tag] = m.group(1).strip() if m else None
+            notes = len(re.findall(r"^[:\-*FPR]\s", raw, re.M))
+            probs = []
+            if not has["TITLE"]: probs.append("no #TITLE")
+            if not has["ARTIST"]: probs.append("no #ARTIST")
+            if notes == 0: probs.append("no notes")
+            if has["MP3"] and not os.path.exists(os.path.join(dp, has["MP3"])):
+                probs.append("missing audio " + has["MP3"])
+            if probs:
+                bad += 1
+                issues.append((path, probs))
+            else:
+                ok += 1
+    log("scan %s: %d ok, %d problems" % (root, ok, bad))
+    for p, probs in issues[:30]:
+        log("  ! %s: %s" % (p, "; ".join(probs)))
+    with open(os.path.join(REPORTS, "scan-%s.log" % time.strftime("%Y%m%d-%H%M%S")), "w") as fh:
+        for p, probs in issues:
+            fh.write("%s\t%s\n" % (p, "; ".join(probs)))
+    return 1 if bad else 0
+
+def cmd_update(args):
+    log("== versions ==")
+    for cmd in (["yt-dlp", "--version"], ["ffmpeg", "-version"], ["usdb_syncer", "--version"]):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            log("  %s: %s" % (cmd[0], (p.stdout or p.stderr).splitlines()[0][:80]))
+        except Exception as e:
+            log("  %s: %r" % (cmd[0], e))
+    # USDX latest upstream
+    try:
+        import urllib.request as u
+        d = json.load(u.urlopen("https://api.github.com/repos/UltraStar-Deluxe/USDX/releases/latest", timeout=20))
+        installed = [f for f in os.listdir(os.path.join(ROOT, "apps")) if f.endswith(".AppImage")]
+        log("  USDX upstream: %s | installed: %s" % (d.get("tag_name"), installed))
+    except Exception as e:
+        log("  USDX upstream check failed: %r" % e)
+    if getattr(args, "do", False):
+        log("== upgrading user-level tools (pipx) ==")
+        for tool in ("usdb_syncer", "yt-dlp"):
+            p = subprocess.run(["pipx", "upgrade", tool], capture_output=True, text=True, timeout=600)
+            log("  pipx upgrade %s: rc=%d %s" % (tool, p.returncode, (p.stdout or "").strip().splitlines()[-1:] or ""))
+
+# --------------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="karaoke", description="UltraStar Deluxe song pipeline")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    pa = sub.add_parser("auth", help="one-time Spotify OAuth (stores refresh token)")
+    pa.add_argument("--port", type=int, default=18080)
+    pa.add_argument("--redirect", default=None,
+                    help="full redirect URI (default http://127.0.0.1:PORT/callback); must be registered")
+    pa.add_argument("--scope", default=None,
+                    help="override scope string (default: user-top-read offline_access); '' = no scope")
+    pa.add_argument("--with-playlists", action="store_true",
+                    help="also request playlist scopes (for `karaoke playlist`)")
+    pa.set_defaults(fn=cmd_auth)
+    pt = sub.add_parser("top", help="fetch Spotify all-time top tracks")
+    pt.add_argument("--limit", type=int, default=100)
+    pt.add_argument("--list", default=None)
+    pt.set_defaults(fn=cmd_top)
+    pp = sub.add_parser("playlist", help="fetch a Spotify playlist")
+    pp.add_argument("playlist")
+    pp.add_argument("--limit", type=int, default=0)
+    pp.add_argument("--list", default=None)
+    pp.set_defaults(fn=lambda a: None)  # handled in main()
+    pl = sub.add_parser("pull", help="pull songs from USDB")
+    pl.add_argument("source", nargs="?", default=None, help="path to 'Artist - Title' list, manifest.json, or --top")
+    pl.add_argument("--top", action="store_true", help="use saved Spotify manifest")
+    pl.add_argument("--limit", type=int, default=None)
+    pl.add_argument("--no-audio", action="store_true")
+    pl.add_argument("--no-cover", action="store_true")
+    pl.add_argument("--force", action="store_true")
+    pl.set_defaults(fn=cmd_pull)
+    ps = sub.add_parser("scan", help="validate song folders")
+    ps.add_argument("--path", default=None)
+    ps.set_defaults(fn=cmd_scan)
+    pu = sub.add_parser("update", help="check/upgrade tools")
+    pu.add_argument("--do", action="store_true")
+    pu.set_defaults(fn=cmd_update)
+    args = ap.parse_args()
+    if args.cmd == "playlist":
+        items = fetch_playlist(playlist_id_from(args.playlist), args.limit)
+        if not items:
+            sys.exit("no tracks (private playlist needs the scope — re-run karaoke auth)")
+        save_manifest(items)
+        log("playlist saved: %d tracks" % len(items))
+        if args.list:
+            with open(args.list, "w") as fh:
+                for it in items:
+                    fh.write("%s - %s\n" % (it["artist"], it["title"]))
+            log("list ->", args.list)
+        return
+    args.fn(args)
+
+if __name__ == "__main__":
+    os.makedirs(REPORTS, exist_ok=True)
+    main()

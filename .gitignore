@@ -1,0 +1,13 @@
+# runtime + personal + copyrighted (never commit)
+songs/
+apps/
+.venv/
+logs/
+reports/
+config/
+*.log
+.spotilog*
+.usdbe*
+260903-*
+*.AppImage
+__pycache__/
