@@ -11,3 +11,4 @@ config/
 260903-*
 *.AppImage
 __pycache__/
+.DS_Store
